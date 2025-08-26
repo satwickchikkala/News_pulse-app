@@ -1,13 +1,32 @@
-# News_pulse-app
-This project, News Sentiment Dashboard, is a web application built using Streamlit that provides real-time news headlines and performs sentiment analysis on them. The application allows users to quickly gauge the overall emotional tone of current events, classifying news articles as positive, negative, or neutral.
-Core Features
-User Authentication: Secure user login and registration to ensure a personalized experience.
+📰 News Sentiment Analyzer
+📌 Overview
 
-Real-time News Feed: Fetches live news headlines from a public API to keep the content fresh and relevant.
+This project is a Streamlit web application that performs sentiment analysis on news headlines and text data.
+It helps users quickly determine whether a piece of news or content is positive, negative, or neutral, using VADER Sentiment Analysis.
 
-Sentiment Analysis: Utilizes a robust sentiment analysis system to classify the tone of each article title. The application's core logic for sentiment analysis is located in the analyze_sentiment function, which uses the VADER (Valence Aware Dictionary and sEntiment Reasoner) library.
+The app also supports user authentication with a local SQLite database and provides visual insights with interactive charts.
 
-Data Visualization: Presents the sentiment data in a clear, interactive bar chart, offering a visual summary of the positive, negative, and neutral articles.
+🚀 Features
 
-Fallback Heuristic: The application is designed for resilience. If the VADER library is not available, a simple fallback system based on a dictionary of positive and negative words is used to ensure the sentiment analysis feature remains functional.
+🔐 User Authentication (Sign Up & Login) using SQLite.
+
+🤖 Sentiment Analysis powered by VADER SentimentIntensityAnalyzer.
+
+If VADER is unavailable, a fallback keyword-based heuristic is used.
+
+📊 Visualization with Altair and Pandas.
+
+📰 News/Text Input – users can paste news or custom text for sentiment check.
+
+🏷️ Sentiment Badges with labels (Positive / Negative / Neutral) and scores.
+
+🛠️ Tech Stack
+
+Frontend/Framework: Streamlit
+
+Database: SQLite
+
+Data Analysis: Pandas, Altair
+
+Sentiment Model: VADER SentimentIntensityAnalyzer
 
