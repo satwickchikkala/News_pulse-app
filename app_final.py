@@ -227,7 +227,7 @@ def delete_saved_article(link: str, username: str) -> bool:
 # -------------------------------
 # API Fetch (with caching)
 # -------------------------------
-API_KEY = "7b19a1553606f09a781a97e4c173d775"  # Replace with st.secrets["GNEWS_API_KEY"] in production
+API_KEY = "YOUR_API_KEY"  # Replace with st.secrets["GNEWS_API_KEY"] in production
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_news(query="technology", time_filter="Anytime", max_articles=10):
