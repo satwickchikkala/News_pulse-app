@@ -73,4 +73,4 @@ It integrates user authentication, profile management, and article saving featur
 ---
 
 ## 👨‍💻 Author
-Developed by **[Your Name]** as part of Internship Project.  
+Developed by **Satwick chikkala**. 
