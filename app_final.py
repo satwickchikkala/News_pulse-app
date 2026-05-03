@@ -1,6 +1,8 @@
-import streamlit as st
+import html
 import re
 from datetime import datetime
+
+import streamlit as st
 
 # ── project modules ───────────────────────────────────────────
 from firebase_config import (
@@ -86,6 +88,14 @@ def sentiment_badge(label):
         f'border-radius:999px;font-size:0.78em;font-weight:600;">'
         f'{cfg[1]} {label.title()}</span>'
     )
+
+
+def _render_raw_html(fragment: str) -> None:
+    """Use Streamlit HTML element so Markdown never treats markup as code or escapes it."""
+    if hasattr(st, "html"):
+        st.html(fragment)
+        return
+    st.markdown(fragment, unsafe_allow_html=True)
 
 def summarize_text(text: str, sentences: int = 2) -> str:
     if not text or len(text.strip()) < 40:
@@ -606,34 +616,39 @@ def render_article_card(article: dict, idx: int, is_saved: bool = False):
     sent_label, _ = analyze_sentiment(desc or title)
     desc_short     = (desc[:110] + "…") if desc and len(desc) > 110 else (desc or "")
 
+    safe_url   = html.escape(str(url), quote=True)
+    safe_image = html.escape(str(image), quote=True)
+    safe_title = html.escape(str(title))
+    safe_src   = html.escape(str(src_name))
+    safe_pub   = html.escape(str(pub_date))
+    safe_desc  = html.escape(str(desc_short)) if desc_short else ""
+
     img_html = (
-        f'<img class="np-card-img" src="{image}" alt="" '
+        f'<img class="np-card-img" src="{safe_image}" alt="" '
         f'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">'
         f'<div class="np-card-img-placeholder" style="display:none">📰</div>'
         if image else
         '<div class="np-card-img-placeholder">📰</div>'
     )
 
-    st.markdown(f"""
-    <div class="np-card">
-      {img_html}
-      <div class="np-card-body">
-        <div class="np-card-source">📡 {src_name}</div>
-        <div class="np-card-title">{title}</div>
-        {"" if not desc_short else f'<div class="np-card-desc">{desc_short}</div>'}
-        <div class="np-card-meta">
-          <span>📅 {pub_date}</span>
-          {sentiment_badge(sent_label)}
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    desc_block = f'<div class="np-card-desc">{safe_desc}</div>' if safe_desc else ""
+    badge_html = sentiment_badge(sent_label)
+    # Single-line HTML avoids Markdown indented-code-block quirks; st.html skips Markdown entirely.
+    card_html = (
+        f'<div class="np-card">{img_html}'
+        f'<div class="np-card-body">'
+        f'<div class="np-card-source">📡 {safe_src}</div>'
+        f'<div class="np-card-title">{safe_title}</div>'
+        f"{desc_block}"
+        f'<div class="np-card-meta"><span>📅 {safe_pub}</span> {badge_html}</div>'
+        f"</div></div>"
+    )
+    _render_raw_html(card_html)
 
     bc1, bc2, bc3 = st.columns(3)
     with bc1:
-        st.markdown(
-            f'<a class="np-btn np-btn-primary" href="{url}" target="_blank">🔗 Read</a>',
-            unsafe_allow_html=True
+        _render_raw_html(
+            f'<a class="np-btn np-btn-primary" href="{safe_url}" target="_blank">🔗 Read</a>'
         )
     with bc2:
         if is_saved:
@@ -647,7 +662,10 @@ def render_article_card(article: dict, idx: int, is_saved: bool = False):
                     st.session_state.uid, st.session_state.id_token,
                     title, url, pub_date, image, src_name, category
                 )
-                st.success(f"✅ {msg}") if ok else st.warning(f"⚠️ {msg}")
+                if ok:
+                    st.success(f"✅ {msg}")
+                else:
+                    st.warning(f"⚠️ {msg}")
     with bc3:
         if st.button("✨ Summarize", key=f"sum_{idx}", use_container_width=True):
             full_text = f"{title}. {desc or ''} {article.get('content','')}"
