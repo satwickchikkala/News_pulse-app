@@ -1,0 +1,8 @@
+streamlit
+requests
+bcrypt
+vaderSentiment
+altair
+pandas
+sumy
+nltk
