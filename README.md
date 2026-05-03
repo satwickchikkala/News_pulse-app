@@ -9,7 +9,7 @@ It integrates user authentication, profile management, and article saving featur
 - 🔑 **User Authentication** (Login & Registration with password hashing)  
 - 📡 **Real-time News Fetching** using **GNews API**  
 - 😀 **Sentiment Analysis** (Positive / Neutral / Negative) on each article  
-- 💾 **SQLite Database** for user profiles and saved articles  
+- 💾 **Firebase Database** for user profiles and saved articles  
 - 🎨 **Streamlit UI** for an interactive and responsive interface  
 - 🗑️ Save & Delete favorite news articles  
 
@@ -22,7 +22,7 @@ It integrates user authentication, profile management, and article saving featur
 
 ### Libraries & Frameworks
 - **Streamlit** → Interactive web app  
-- **SQLite3** → Database storage  
+- **Firestore** → Database storage  
 - **Requests** → API integration  
 - **NLTK / TextBlob / VADER** → Sentiment analysis  
 - **Hashlib** → Secure password hashing  
@@ -44,8 +44,7 @@ It integrates user authentication, profile management, and article saving featur
 
 ## 📊 Algorithms Used
 - **SHA-256 Hashing** → Secure password storage  
-- **VADER Sentiment Analysis** → News classification  
-- **SQL Queries** → (INSERT, SELECT, DELETE) for managing data  
+- **VADER Sentiment Analysis** → News classification   
 
 ---
 
@@ -68,7 +67,6 @@ It integrates user authentication, profile management, and article saving featur
 - [GNews API Documentation](https://gnews.io/docs)  
 - [Streamlit Documentation](https://docs.streamlit.io)  
 - [NLTK Documentation](https://www.nltk.org/)  
-- [SQLite Documentation](https://www.sqlite.org/docs.html)  
 
 ---
 
