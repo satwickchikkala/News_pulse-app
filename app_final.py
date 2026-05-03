@@ -1,1330 +1,853 @@
 import streamlit as st
-import sqlite3
-import requests
-from datetime import datetime, timedelta
-from auth import create_user, verify_user  # Import auth functions
+import re
+from datetime import datetime
 
-import altair as alt
-import pandas as pd
+# ── project modules ───────────────────────────────────────────
+from firebase_config import (
+    sign_up_email, sign_in_email, send_password_reset,
+)
+from database import (save_article, fetch_saved_articles,
+                      delete_article, count_saved_articles)
+from news_api import fetch_news
 
-# Sentiment analysis setup
+# ── optional deps ─────────────────────────────────────────────
+try:
+    import altair as alt
+    import pandas as pd
+    _ALTAIR = True
+except ImportError:
+    _ALTAIR = False
+
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    _vader_analyzer = SentimentIntensityAnalyzer()
+    _vader = SentimentIntensityAnalyzer()
 except Exception:
-    _vader_analyzer = None
+    _vader = None
 
-def analyze_sentiment(text: str):
-    """Return (label, score) using VADER if available, else a simple heuristic."""
-    if not text:
-        return "neutral", 0.0
-    text = text.strip()
-    if _vader_analyzer is not None:
-        scores = _vader_analyzer.polarity_scores(text)
-        compound = scores.get("compound", 0.0)
-        if compound >= 0.05:
-            return "positive", compound
-        elif compound <= -0.05:
-            return "negative", compound
-        else:
-            return "neutral", compound
-    # Fallback heuristic
-    pos_words = ["good","great","excellent","positive","growth","win","success","benefit","surge","record","best","strong"]
-    neg_words = ["bad","poor","terrible","negative","loss","fail","decline","drop","worst","weak","fraud","lawsuit"]
-    pos = sum(w in text.lower() for w in pos_words)
-    neg = sum(w in text.lower() for w in neg_words)
-    if pos > neg:
-        return "positive", (pos-neg)/10.0
-    if neg > pos:
-        return "negative", -(neg-pos)/10.0
-    return "neutral", 0.0
-
-def sentiment_badge(label: str) -> str:
-    color = {"positive":"#10b981","neutral":"#6b7280","negative":"#ef4444"}.get(label,"#6b7280")
-    emoji = {"positive":"😊","neutral":"😐","negative":"☹️"}.get(label,"😐")
-    return f'<span style="background:{color}1A;color:{color};padding:6px 10px;border-radius:999px;font-size:0.9em;">{emoji} {label.title()}</span>'
-
-def draw_sentiment_chart(sentiment_counts, title='Sentiment Analysis'):
-    """Draw a bar chart of sentiment counts using Altair."""
-    # Convert dict to DataFrame
-    data = pd.DataFrame([
-        {"sentiment": "Positive", "count": sentiment_counts.get("positive", 0)},
-        {"sentiment": "Neutral", "count": sentiment_counts.get("neutral", 0)},
-        {"sentiment": "Negative", "count": sentiment_counts.get("negative", 0)},
-    ])
-
-    # Create the Altair chart
-    chart = alt.Chart(data).mark_bar().encode(
-        x=alt.X('sentiment', sort=['Positive', 'Neutral', 'Negative']),
-        y='count',
-        color=alt.Color('sentiment', scale=alt.Scale(domain=['Positive', 'Neutral', 'Negative'], range=['#10b981', '#6b7280', '#ef4444'])),
-        tooltip=['sentiment', 'count']
-    ).properties(
-        title=title
-    ).interactive()
-
-    # Display the chart in Streamlit
-    st.altair_chart(chart, use_container_width=True)
-
-# -------------------------------
-# Page Configuration
-# -------------------------------
+# ─────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="News Pulse",
-    page_icon="📰",
+    page_title="NewsPulse",
+    page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed",
 )
 
-# -------------------------------
-# Authentication Setup
-# -------------------------------
-# Initialize session state variables
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-if "username" not in st.session_state:
-    st.session_state.username = None
-if "register" not in st.session_state:
-    st.session_state.register = False
+# ─────────────────────────────────────────────────────────────
+# SESSION STATE DEFAULTS
+# ─────────────────────────────────────────────────────────────
+for k, v in {
+    "authenticated": False,
+    "uid":           None,
+    "id_token":      None,
+    "email":         None,
+    "display_name":  None,
+    "page":          "home",
+    "articles":      [],
+    "current_query": "",
+    "time_filter":   "Anytime",
+    "auth_view":     "login",
+    "google_error":  None,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# -------------------------------
-# Database setup
-# -------------------------------
-def get_connection():
-    return sqlite3.connect("news_pulse.db")
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
+def is_valid_email(email: str) -> bool:
+    return bool(re.match(r"^[\w\.\+\-]+@[\w\-]+\.[a-zA-Z]{2,}$", email.strip()))
 
-def create_table():
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    # Create table if it doesn't exist
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS articles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            link TEXT,
-            published_at TEXT,
-            image_url TEXT,
-            source TEXT,
-            category TEXT,
-            saved_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            username TEXT
-        )
-    """)
-    
-    # Check current columns
-    cursor.execute("PRAGMA table_info(articles)")
-    columns = [column[1] for column in cursor.fetchall()]
-    
-    # Add any missing new columns (including username)
-    new_columns = {
-        'image_url': 'TEXT',
-        'source': 'TEXT',
-        'category': 'TEXT',
-        'saved_at': 'TEXT DEFAULT CURRENT_TIMESTAMP',
-        'username': 'TEXT'
-    }
-    for col_name, col_type in new_columns.items():
-        if col_name not in columns:
-            cursor.execute(f"ALTER TABLE articles ADD COLUMN {col_name} {col_type}")
-    
-    # Add a uniqueness constraint per-user to avoid duplicates of the same link
-    # SQLite can't add UNIQUE easily post-hoc; create an index that enforces uniqueness pair if not exists
-    # (Creates a unique index on (username, link))
-    cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_user_link_unique
-        ON articles(username, link)
-    """)
+def analyze_sentiment(text: str):
+    if not text:
+        return "neutral", 0.0
+    if _vader:
+        s = _vader.polarity_scores(text)
+        c = s["compound"]
+        if   c >=  0.05: return "positive", c
+        elif c <= -0.05: return "negative", c
+        else:            return "neutral",  c
+    pos = sum(w in text.lower() for w in ["good","great","win","growth","success","surge","record"])
+    neg = sum(w in text.lower() for w in ["bad","crash","fail","loss","decline","drop","worst"])
+    if pos > neg: return "positive",  0.5
+    if neg > pos: return "negative", -0.5
+    return "neutral", 0.0
 
-    conn.commit()
-    conn.close()
+def sentiment_badge(label):
+    cfg = {
+        "positive": ("#10b981","😊"),
+        "neutral":  ("#94a3b8","😐"),
+        "negative": ("#f43f5e","😟"),
+    }.get(label, ("#94a3b8","😐"))
+    return (
+        f'<span style="background:{cfg[0]}22;color:{cfg[0]};'
+        f'border:1px solid {cfg[0]}44;padding:3px 10px;'
+        f'border-radius:999px;font-size:0.78em;font-weight:600;">'
+        f'{cfg[1]} {label.title()}</span>'
+    )
 
-create_table()
-
-def save_article(title, link, published_at, image_url, source="Unknown", category="General", username=None):
-    """Save an article uniquely per user."""
-    if not username:
-        return False, "Not logged in."
+def summarize_text(text: str, sentences: int = 2) -> str:
+    if not text or len(text.strip()) < 40:
+        return "Not enough content to summarize."
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # Check if article already exists for this user to avoid duplicates
-        cursor.execute("SELECT COUNT(*) FROM articles WHERE link = ? AND username = ?", (link, username))
-        if cursor.fetchone()[0] > 0:
-            conn.close()
-            return False, "Article already saved!"
-        
-        # Insert new article
-        cursor.execute(
-            "INSERT INTO articles (title, link, published_at, image_url, source, category, saved_at, username) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (str(title) if title else "No Title", 
-             str(link) if link else "", 
-             str(published_at) if published_at else "Unknown", 
-             str(image_url) if image_url else "",
-             str(source) if source else "Unknown",
-             str(category) if category else "General",
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-             str(username)),
-        )
-        conn.commit()
-        conn.close()
-        return True, "Article saved successfully!"
-    except sqlite3.IntegrityError:
-        # Unique index hit (username, link)
-        if 'conn' in locals():
-            conn.close()
-        return False, "Article already saved!"
-    except Exception as e:
-        if 'conn' in locals():
-            conn.close()
-        return False, f"Error saving article: {str(e)}"
-
-def fetch_articles_from_db(username=None):
-    """Fetch saved articles for the logged-in user only."""
-    if not username:
-        return []
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT title, link, published_at, image_url, source, category, saved_at 
-        FROM articles 
-        WHERE username = ?
-        ORDER BY id DESC
-    """, (username,))
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-def get_saved_articles_count(username=None):
-    if not username:
-        return 0
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM articles WHERE username = ?", (username,))
-    count = cursor.fetchone()[0]
-    conn.close()
-    return count
-
-
-def delete_saved_article(link: str, username: str) -> bool:
-    """Delete a saved article for the given user by its link."""
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM articles WHERE username = ? AND link = ?", (username, link))
-        conn.commit()
-        deleted = cursor.rowcount > 0
-        conn.close()
-        return deleted
+        from sumy.parsers.plaintext import PlaintextParser
+        from sumy.nlp.tokenizers    import Tokenizer
+        from sumy.summarizers.luhn  import LuhnSummarizer
+        import nltk
+        for tok in ("punkt", "punkt_tab"):
+            try:    nltk.data.find(f"tokenizers/{tok}")
+            except LookupError: nltk.download(tok, quiet=True)
+        parser     = PlaintextParser.from_string(text, Tokenizer("english"))
+        summarizer = LuhnSummarizer()
+        result     = summarizer(parser.document, sentences)
+        out        = " ".join(str(s) for s in result).strip()
+        return out if out else text[:300] + "…"
     except Exception:
-        try:
-            conn.close()
-        except:
-            pass
-        return False
+        return text[:300] + "…"
 
-# -------------------------------
-# API Fetch (with caching)
-# -------------------------------
-API_KEY = "YOUR_API_KEY"  # Replace with st.secrets["GNEWS_API_KEY"] in production
+def draw_sentiment_chart(counts: dict, title: str = "Sentiment"):
+    if not _ALTAIR or not counts:
+        return
+    df = pd.DataFrame([
+        {"Sentiment": "Positive", "Count": counts.get("positive", 0)},
+        {"Sentiment": "Neutral",  "Count": counts.get("neutral",  0)},
+        {"Sentiment": "Negative", "Count": counts.get("negative", 0)},
+    ])
+    chart = (
+        alt.Chart(df)
+        .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
+        .encode(
+            x=alt.X("Sentiment:N", sort=["Positive","Neutral","Negative"],
+                    axis=alt.Axis(labelColor="#94a3b8", tickColor="#1e293b", domainColor="#1e293b")),
+            y=alt.Y("Count:Q",
+                    axis=alt.Axis(labelColor="#94a3b8", tickColor="#1e293b",
+                                  domainColor="#1e293b", gridColor="#1e293b")),
+            color=alt.Color("Sentiment:N", scale=alt.Scale(
+                domain=["Positive","Neutral","Negative"],
+                range= ["#10b981","#94a3b8","#f43f5e"]
+            ), legend=None),
+            tooltip=["Sentiment","Count"],
+        )
+        .properties(
+            title=alt.TitleParams(title, color="#e2e8f0"),
+            background="transparent", height=200
+        )
+    )
+    st.altair_chart(chart, use_container_width=True)
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_news(query="technology", time_filter="Anytime", max_articles=10):
-    # Build URL
-    url = f"https://gnews.io/api/v4/search?q={query}&lang=en&max={max_articles}&token={API_KEY}"
+def format_date(raw: str) -> str:
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).strftime("%b %d, %Y")
+    except Exception:
+        return raw or "Unknown"
 
-    if time_filter == "Past 24h":
-        from_date = (datetime.utcnow() - timedelta(days=1)).isoformat("T") + "Z"
-        url += f"&from={from_date}"
-    elif time_filter == "Past week":
-        from_date = (datetime.utcnow() - timedelta(days=7)).isoformat("T") + "Z"
-        url += f"&from={from_date}"
-
-    # Make request
-    response = requests.get(url, timeout=10)
-    if response.status_code == 200:
-        data = response.json()
-        return data.get("articles", [])
-    else:
-        # Return empty list on API error; UI handles messaging
-        return []
-
-# -------------------------------
-# Theme Toggle (Dark/Light)
-# -------------------------------
-if "theme" not in st.session_state:
-    st.session_state["theme"] = "dark"
-
-def toggle_theme():
-    st.session_state["theme"] = "light" if st.session_state["theme"] == "dark" else "dark"
-
-# -------------------------------
-# Login/Register Form
-# -------------------------------
-def show_login_form():
-    """Display login form with enhanced UI"""
-    # Create centered layout
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col2:
-        st.markdown("""
-        <div style="text-align: center; padding: 50px 0 30px 0;">
-            <h1 style="font-size: 4em; margin-bottom: 10px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;">
-                📰 News Pulse
-            </h1>
-            <p style="font-size: 1.2em; color: rgba(255,255,255,0.8); margin-bottom: 30px;">
-                Your Gateway to Global News
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Login/Register container
-        with st.container():
-            if st.session_state.register:
-                st.markdown("""
-                <div style="background: rgba(255,255,255,0.1); backdrop-filter: blur(20px); 
-                     border-radius: 20px; padding: 40px; border: 1px solid rgba(255,255,255,0.1);">
-                    <h2 style="text-align: center; color: white; margin-bottom: 30px; font-size: 2em;">
-                        🎯 Create Your Account
-                    </h2>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                with st.form("register_form"):
-                    new_username = st.text_input("👤 Username", placeholder="Enter your username")
-                    new_email = st.text_input("📧 Email", placeholder="Enter your email")
-                    new_password = st.text_input("🔒 Password", type="password", placeholder="Create a strong password")
-                    confirm_password = st.text_input("🔐 Confirm Password", type="password", placeholder="Confirm your password")
-                    
-                    submitted = st.form_submit_button("🚀 Create Account", use_container_width=True)
-                    
-                    if submitted:
-                        if not new_username or not new_password:
-                            st.error("Username and password are required!")
-                        elif len(new_password) < 6:
-                            st.error("Password must be at least 6 characters long!")
-                        elif new_password != confirm_password:
-                            st.error("Passwords do not match!")
-                        else:
-                            success, message = create_user(new_username, new_password, new_email)
-                            if success:
-                                st.success("✅ " + message)
-                                st.balloons()
-                                st.session_state.register = False
-                                st.rerun()
-                            else:
-                                st.error("❌ " + message)
-                
-                st.markdown("<div style='text-align: center; margin-top: 20px; color: rgba(255,255,255,0.8);'>Already have an account?</div>", unsafe_allow_html=True)
-                if st.button("🔑 Login instead", use_container_width=True):
-                    st.session_state.register = False
-                    st.rerun()
-                    
-            else:
-                st.markdown("""
-                <div style="background: rgba(255,255,255,0.1); backdrop-filter: blur(20px); 
-                     border-radius: 20px; padding: 40px; border: 1px solid rgba(255,255,255,0.1);">
-                    <h2 style="text-align: center; color: white; margin-bottom: 30px; font-size: 2em;">
-                        🔐 Welcome Back
-                    </h2>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                with st.form("login_form"):
-                    username = st.text_input("👤 Username", placeholder="Enter your username")
-                    password = st.text_input("🔒 Password", type="password", placeholder="Enter your password")
-                    
-                    submitted = st.form_submit_button("🚀 Login", use_container_width=True)
-                    
-                    if submitted:
-                        if not username or not password:
-                            st.error("Please enter both username and password!")
-                        else:
-                            success, message = verify_user(username, password)
-                            if success:
-                                st.session_state.authenticated = True
-                                st.session_state.username = username
-                                st.success("✅ " + message)
-                                st.balloons()
-                                st.rerun()
-                            else:
-                                st.error("❌ " + message)
-                
-                st.markdown("<div style='text-align: center; margin-top: 20px; color: rgba(255,255,255,0.8);'>Don't have an account?</div>", unsafe_allow_html=True)
-                if st.button("📝 Register now", use_container_width=True):
-                    st.session_state.register = True
-                    st.rerun()
-
-        # Demo credentials info
-        with st.expander("🎯 Demo Credentials", expanded=False):
-            st.info("""
-            **For testing purposes:**
-            - Username: demo
-            - Password: demo123
-            
-            Or create your own account above!
-            """)
-
-# Enhanced CSS with modern animations and glassmorphism
-def load_css():
-    st.markdown(f"""
+# ─────────────────────────────────────────────────────────────
+# CSS
+# ─────────────────────────────────────────────────────────────
+def inject_css():
+    st.markdown("""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-    @import url('https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css');
+    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap');
 
-    * {{
-        font-family: 'Inter', sans-serif;
-    }}
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, [data-testid="stAppViewContainer"] {
+        background: #080c14 !important;
+        color: #e2e8f0;
+        font-family: 'DM Sans', sans-serif;
+    }
+    [data-testid="stAppViewContainer"]  { padding: 0 !important; }
+    [data-testid="stHeader"]            { display: none !important; }
+    [data-testid="stSidebar"]           { display: none !important; }
+    #MainMenu, footer, .stDeployButton  { display: none !important; }
+    section[data-testid="stMain"] > div { padding: 0 !important; }
+    [data-testid="stMainBlockContainer"]{ padding: 0 !important; max-width: 100% !important; }
 
-    /* Hide Streamlit elements */
-    #MainMenu {{visibility: hidden;}}
-    footer {{visibility: hidden;}}
-    .stDeployButton {{display:none;}}
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
 
-    /* Custom scrollbar */
-    ::-webkit-scrollbar {{
-        width: 8px;
-    }}
+    h1,h2,h3 { font-family: 'Syne', sans-serif; }
 
-    ::-webkit-scrollbar-track {{
-        background: rgba(255, 255, 255, 0.1);
-        border-radius: 10px;
-    }}
+    /* ── navbar ─────────────────────────────────── */
+    .np-nav {
+        position: sticky; top: 0; z-index: 1000;
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 0 40px; height: 64px;
+        background: rgba(8,12,20,0.95);
+        backdrop-filter: blur(18px);
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+    .np-nav-logo {
+        font-family: 'Syne', sans-serif;
+        font-size: 1.4rem; font-weight: 800;
+        background: linear-gradient(135deg, #38bdf8, #818cf8);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        background-clip: text; letter-spacing: -0.5px;
+    }
+    .np-nav-user {
+        display: flex; align-items: center; gap: 10px;
+        padding: 6px 14px; border-radius: 999px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.08);
+        font-size: 0.85rem; color: #94a3b8;
+    }
+    .np-nav-avatar {
+        width: 28px; height: 28px; border-radius: 50%;
+        background: linear-gradient(135deg, #38bdf8, #818cf8);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 0.75rem; font-weight: 700; color: #fff;
+    }
 
-    ::-webkit-scrollbar-thumb {{
-        background: linear-gradient(45deg, #667eea, #764ba2);
-        border-radius: 10px;
-    }}
-
-    ::-webkit-scrollbar-thumb:hover {{
-        background: linear-gradient(45deg, #764ba2, #667eea);
-    }}
-
-    /* Animated background */
-    .stApp {{
-        background: linear-gradient(-45deg, #1a1a2e, #16213e, #0f3460, #1a1a2e);
-        background-size: 400% 400%;
-        animation: gradientShift 15s ease infinite;
-        min-height: 100vh;
-        color: #ffffff;
-    }}
-
-    @keyframes gradientShift {{
-        0% {{ background-position: 0% 50%; }}
-        50% {{ background-position: 100% 50%; }}
-        100% {{ background-position: 0% 50%; }}
-    }}
-
-    /* Main header */
-    .main-header {{
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
+    /* ── hero ────────────────────────────────────── */
+    .np-hero {
+        padding: 72px 40px 48px; text-align: center;
+        background: radial-gradient(ellipse 80% 50% at 50% -10%,
+                    rgba(56,189,248,0.12) 0%, transparent 70%);
+    }
+    .np-hero-tag {
+        display: inline-block; margin-bottom: 20px;
+        padding: 4px 14px; border-radius: 999px;
+        background: rgba(56,189,248,0.1);
+        border: 1px solid rgba(56,189,248,0.3);
+        color: #38bdf8; font-size: 0.78rem; font-weight: 600;
+        letter-spacing: 1.5px; text-transform: uppercase;
+    }
+    .np-hero-title {
+        font-family: 'Syne', sans-serif;
+        font-size: clamp(2.4rem, 5vw, 4rem);
+        font-weight: 800; line-height: 1.08;
+        letter-spacing: -1.5px; color: #f1f5f9; margin-bottom: 16px;
+    }
+    .np-hero-title span {
+        background: linear-gradient(135deg, #38bdf8 0%, #818cf8 100%);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
         background-clip: text;
-        font-size: 3.5em;
-        font-weight: 800;
-        text-align: center;
-        margin: 20px 0;
-        animation: glow 2s ease-in-out infinite alternate;
-    }}
+    }
+    .np-hero-sub { color: #64748b; font-size: 1.05rem; margin-bottom: 36px; }
 
-    @keyframes glow {{
-        from {{ filter: drop-shadow(0 0 20px rgba(102, 126, 234, 0.3)); }}
-        to {{ filter: drop-shadow(0 0 40px rgba(118, 75, 162, 0.5)); }}
-    }}
+    /* ── trending ────────────────────────────────── */
+    .np-trending {
+        padding: 0 40px 32px;
+        display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    }
+    .np-trending-label {
+        font-size: 0.75rem; font-weight: 700;
+        letter-spacing: 1.5px; text-transform: uppercase;
+        color: #475569; white-space: nowrap;
+    }
 
-    /* Glassmorphism cards */
-    .glass-card {{
-        background: rgba(255, 255, 255, 0.1);
-        backdrop-filter: blur(20px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 20px;
-        padding: 25px;
-        margin: 20px 0;
-        box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
-        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        position: relative;
-        overflow: hidden;
-    }}
+    /* ── section heading ─────────────────────────── */
+    .np-section-head {
+        padding: 0 40px 20px;
+        font-family: 'Syne', sans-serif;
+        font-size: 1.1rem; font-weight: 700;
+        color: #94a3b8; letter-spacing: -0.3px;
+    }
+    .np-section-head span { color: #e2e8f0; }
 
-    .glass-card:hover {{
-        transform: translateY(-5px);
-        box-shadow: 0 20px 40px 0 rgba(31, 38, 135, 0.5);
-    }}
-
-    /* Article cards */
-    .article-card {{
-        background: rgba(255, 255, 255, 0.08);
-        backdrop-filter: blur(15px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 16px;
-        padding: 20px;
-        margin: 15px 0;
-        transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-        position: relative;
-        overflow: hidden;
-        cursor: pointer;
-    }}
-
-    .article-card::after {{
-        content: '';
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        height: 3px;
-        background: linear-gradient(90deg, #667eea, #764ba2, #f093fb);
-        transform: scaleX(0);
-        transition: transform 0.3s ease;
-    }}
-
-    .article-card:hover::after {{
-        transform: scaleX(1);
-    }}
-
-    .article-card:hover {{
-        transform: translateY(-8px);
-        background: rgba(255, 255, 255, 0.12);
-        box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-    }}
-
-    /* Enhanced buttons */
-    .stButton > button {{
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
-        color: white !important;
-        border: none !important;
-        border-radius: 12px !important;
-        padding: 12px 24px !important;
-        font-weight: 600 !important;
-        font-size: 14px !important;
-        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
-        box-shadow: 0 4px 15px 0 rgba(102, 126, 234, 0.3) !important;
-    }}
-
-    .stButton > button:hover {{
-        transform: translateY(-2px) scale(1.05) !important;
-        box-shadow: 0 8px 25px 0 rgba(102, 126, 234, 0.5) !important;
-    }}
-
-    /* Sidebar styling */
-    .css-1d391kg {{
-        background: rgba(255, 255, 255, 0.05) !important;
-        backdrop-filter: blur(20px) !important;
-        border-right: 1px solid rgba(255, 255, 255, 0.1) !important;
-    }}
-
-    /* Text styling */
-    .article-title {{
-        color: #ffffff !important;
-        font-size: 1.4em !important;
-        font-weight: 600 !important;
-        margin-bottom: 15px !important;
-        line-height: 1.4 !important;
-    }}
-
-    .article-date {{
-        color: #667eea !important;
-        font-size: 0.9em !important;
-        margin-bottom: 15px !important;
-        font-weight: 500 !important;
-    }}
-
-    .article-source {{
-        color: #f093fb !important;
-        font-size: 0.85em !important;
-        font-weight: 600 !important;
-        text-transform: uppercase;
-        letter-spacing: 1px !important;
-    }}
-
-    .news-header {{
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        background-clip: text;
-        font-size: 2.5em;
-        font-weight: 700;
-        text-align: center;
-        margin: 30px 0;
-        animation: fadeInUp 0.8s ease-out;
-    }}
-
-    /* Stats cards */
-    .stats-card {{
-        background: rgba(255, 255, 255, 0.1);
-        backdrop-filter: blur(15px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 15px;
-        padding: 20px;
-        text-align: center;
-        transition: all 0.3s ease;
-        position: relative;
-        overflow: hidden;
-    }}
-
-    .stats-card::before {{
-        content: '';
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        height: 4px;
-        background: linear-gradient(90deg, #667eea, #764ba2);
-    }}
-
-    .stats-card:hover {{
-        transform: translateY(-5px);
-        background: rgba(255, 255, 255, 0.15);
-    }}
-
-    .stats-number {{
-        font-size: 2.5em;
-        font-weight: 800;
-        color: #667eea;
-        margin-bottom: 10px;
-    }}
-
-    .stats-label {{
-        color: rgba(255, 255, 255, 0.8);
-        font-size: 1.1em;
-        font-weight: 500;
-    }}
-
-    /* Image styling */
-    .article-image {{
-        border-radius: 12px;
-        overflow: hidden;
-        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
-        transition: transform 0.3s ease;
-        height: 200px;
-        object-fit: cover;
-        width: 100%;
-    }}
-
-    .article-image:hover {{
-        transform: scale(1.05);
-    }}
-
-    /* Welcome section */
-    .welcome-section {{
-        background: rgba(255, 255, 255, 0.1);
-        backdrop-filter: blur(20px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 20px;
-        padding: 60px 40px;
-        text-align: center;
-        margin: 40px 0;
-        position: relative;
-        overflow: hidden;
-    }}
-
-    .welcome-section::before {{
-        content: '';
-        position: absolute;
-        top: -50%;
-        left: -50%;
-        width: 200%;
-        height: 200%;
-        background: conic-gradient(from 0deg, transparent, rgba(102, 126, 234, 0.1), transparent);
-        animation: rotate 10s linear infinite;
-    }}
-
-    @keyframes rotate {{
-        100% {{ transform: rotate(360deg); }}
-    }}
-
-    .welcome-content {{
-        position: relative;
-        z-index: 1;
-    }}
-
-    /* Trending topics */
-    .trending-topic {{
-        background: rgba(255, 255, 255, 0.1) !important;
-        backdrop-filter: blur(10px) !important;
-        border: 1px solid rgba(255, 255, 255, 0.2) !important;
-        color: white !important;
-        border-radius: 20px !important;
-        padding: 8px 16px !important;
-        margin: 5px !important;
-        font-size: 12px !important;
-        transition: all 0.3s ease !important;
-    }}
-
-    .trending-topic:hover {{
-        background: rgba(102, 126, 234, 0.3) !important;
-        transform: translateY(-2px) !important;
-        box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3) !important;
-    }}
-
-    /* Loading animation */
-    .loading {{
-        display: inline-block;
-        width: 20px;
-        height: 20px;
-        border: 3px solid rgba(102, 126, 234, 0.3);
-        border-radius: 50%;
-        border-top-color: #667eea;
-        animation: spin 1s ease-in-out infinite;
-    }}
-
-    @keyframes spin {{
-        to {{ transform: rotate(360deg); }}
-    }}
-
-    /* Animations */
-    @keyframes fadeInUp {{
-        from {{
-            opacity: 0;
-            transform: translateY(30px);
-        }}
-        to {{
-            opacity: 1;
-            transform: translateY(0);
-        }}
-    }}
-
-    /* Empty state styling */
-    .empty-state {{
-        text-align: center;
-        padding: 60px 20px;
-        background: rgba(255, 255, 255, 0.08);
-        border-radius: 20px;
-        margin: 20px 0;
-        border: 2px dashed rgba(255, 255, 255, 0.2);
-    }}
-
-    .empty-state-icon {{
-        font-size: 4em;
+    /* ── article card ────────────────────────────── */
+    .np-card {
+        background: #0f172a;
+        border: 1px solid rgba(255,255,255,0.06);
+        border-radius: 16px; overflow: hidden;
+        transition: transform 0.22s ease, border-color 0.22s ease, box-shadow 0.22s ease;
+        display: flex; flex-direction: column;
         margin-bottom: 20px;
-        opacity: 0.6;
-    }}
+    }
+    .np-card:hover {
+        transform: translateY(-4px);
+        border-color: rgba(56,189,248,0.25);
+        box-shadow: 0 20px 40px -10px rgba(0,0,0,0.5);
+    }
+    .np-card-img { width: 100%; height: 190px; object-fit: cover; display: block; background: #1e293b; }
+    .np-card-img-placeholder {
+        width: 100%; height: 190px;
+        background: linear-gradient(135deg, #0f2a44 0%, #1a1040 100%);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 2.5rem; color: rgba(255,255,255,0.12);
+    }
+    .np-card-body { padding: 18px 18px 14px; flex: 1; display: flex; flex-direction: column; }
+    .np-card-source {
+        font-size: 0.72rem; font-weight: 700; letter-spacing: 1.2px;
+        text-transform: uppercase; color: #38bdf8; margin-bottom: 8px;
+    }
+    .np-card-title {
+        font-family: 'Syne', sans-serif;
+        font-size: 1rem; font-weight: 700; line-height: 1.45;
+        color: #e2e8f0; margin-bottom: 10px; flex: 1;
+    }
+    .np-card-desc {
+        font-size: 0.85rem; color: #64748b; line-height: 1.55; margin-bottom: 12px;
+        display: -webkit-box; -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical; overflow: hidden;
+    }
+    .np-card-meta {
+        display: flex; align-items: center; justify-content: space-between;
+        font-size: 0.78rem; color: #475569; margin-bottom: 12px;
+    }
+    .np-btn {
+        padding: 7px 14px; border-radius: 8px;
+        font-size: 0.8rem; font-weight: 600;
+        border: 1px solid rgba(255,255,255,0.1);
+        color: #94a3b8; cursor: pointer;
+        text-decoration: none; display: inline-block;
+        background: rgba(255,255,255,0.04);
+        transition: all 0.15s;
+    }
+    .np-btn:hover { background: rgba(255,255,255,0.09); color: #e2e8f0; }
+    .np-btn-primary {
+        background: rgba(56,189,248,0.12);
+        border-color: rgba(56,189,248,0.3); color: #38bdf8;
+    }
+    .np-btn-primary:hover { background: rgba(56,189,248,0.22); }
+    .np-summary {
+        margin-top: 10px; padding: 12px 15px;
+        background: rgba(129,140,248,0.08);
+        border-left: 3px solid #818cf8; border-radius: 8px;
+        color: #c7d2fe; font-size: 0.85rem; line-height: 1.65;
+    }
+    .np-summary strong { color: #818cf8; }
 
-    .empty-state-title {{
-        font-size: 1.8em;
-        color: white;
-        margin-bottom: 15px;
-        font-weight: 600;
-    }}
-
-    .empty-state-subtitle {{
-        color: rgba(255, 255, 255, 0.7);
-        font-size: 1.1em;
-        margin-bottom: 25px;
-    }}
-
-    /* Input styling */
-    .stTextInput > div > div > input {{
-        background: rgba(255, 255, 255, 0.1) !important;
-        border: 1px solid rgba(255, 255, 255, 0.2) !important;
-        color: white !important;
+    /* ── auth card ───────────────────────────────── */
+    .np-auth-card {
+        width: 100%; max-width: 440px;
+        background: #0f172a;
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 24px; padding: 44px 40px;
+        margin: 60px auto;
+    }
+    .np-auth-logo {
+        text-align: center; margin-bottom: 8px;
+        font-family: 'Syne', sans-serif;
+        font-size: 2rem; font-weight: 800;
+        background: linear-gradient(135deg, #38bdf8, #818cf8);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        background-clip: text;
+    }
+    .np-auth-tagline {
+        text-align: center; color: #475569;
+        font-size: 0.88rem; margin-bottom: 36px;
+    }
+    .np-auth-title {
+        font-family: 'Syne', sans-serif;
+        font-size: 1.5rem; font-weight: 700;
+        color: #e2e8f0; margin-bottom: 24px; text-align: center;
+    }
+    .np-auth-divider {
+        display: flex; align-items: center; gap: 14px;
+        margin: 20px 0; color: #334155; font-size: 0.82rem;
+    }
+    .np-auth-divider::before, .np-auth-divider::after {
+        content: ''; flex: 1; height: 1px;
+        background: rgba(255,255,255,0.06);
+    }
+    .np-auth-footer {
+        text-align: center; margin-top: 20px;
+        color: #475569; font-size: 0.88rem;
+    }
+/* streamlit input overrides */
+    .stTextInput > div > div > input {
+        background: rgba(255,255,255,0.04) !important;
+        border: 1px solid rgba(255,255,255,0.1) !important;
         border-radius: 10px !important;
-    }}
-
-    .stTextInput > div > div > input:focus {{
-        border-color: #667eea !important;
-        box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.3) !important;
-    }}
-
-    /* Radio button styling */
-    .stRadio > div {{
-        background: rgba(255, 255, 255, 0.05) !important;
+        color: #e2e8f0 !important;
+        font-family: 'DM Sans', sans-serif !important;
+        padding: 12px 14px !important;
+    }
+    .stTextInput > div > div > input:focus {
+        border-color: #38bdf8 !important;
+        box-shadow: 0 0 0 3px rgba(56,189,248,0.12) !important;
+    }
+    div.stButton > button {
+        background: linear-gradient(135deg, #0ea5e9, #6366f1) !important;
+        color: #fff !important; border: none !important;
         border-radius: 10px !important;
-        padding: 10px !important;
-    }}
+        font-family: 'DM Sans', sans-serif !important;
+        font-weight: 600 !important; font-size: 0.9rem !important;
+        padding: 10px 20px !important;
+        transition: opacity 0.18s, transform 0.18s !important;
+        box-shadow: 0 4px 14px rgba(14,165,233,0.25) !important;
+    }
+    div.stButton > button:hover {
+        opacity: 0.9 !important; transform: translateY(-1px) !important;
+    }
 
-    /* Form styling */
-    .stForm {{
-        background: rgba(255, 255, 255, 0.05) !important;
-        border-radius: 15px !important;
-        padding: 20px !important;
-        border: 1px solid rgba(255, 255, 255, 0.1) !important;
-    }}
+    /* stats */
+    .np-stat {
+        background: #0f172a;
+        border: 1px solid rgba(255,255,255,0.06);
+        border-radius: 14px; padding: 18px 20px;
+        position: relative; overflow: hidden; margin-bottom: 8px;
+    }
+    .np-stat::before {
+        content: ''; position: absolute;
+        top: 0; left: 0; right: 0; height: 2px;
+        background: linear-gradient(90deg, #38bdf8, #818cf8);
+    }
+    .np-stat-val {
+        font-family: 'Syne', sans-serif;
+        font-size: 1.8rem; font-weight: 800;
+        color: #38bdf8; line-height: 1; margin-bottom: 4px;
+    }
+    .np-stat-lbl { font-size: 0.8rem; color: #475569; font-weight: 500; }
+
+    /* empty state */
+    .np-empty { text-align: center; padding: 80px 20px; color: #334155; }
+    .np-empty-icon { font-size: 3rem; margin-bottom: 16px; opacity: 0.5; }
+    .np-empty-title {
+        font-family: 'Syne', sans-serif;
+        font-size: 1.4rem; font-weight: 700; color: #475569; margin-bottom: 8px;
+    }
+    .np-empty-sub { font-size: 0.9rem; color: #334155; }
+
+    /* features */
+    .np-feature {
+        background: #0f172a;
+        border: 1px solid rgba(255,255,255,0.06);
+        border-radius: 16px; padding: 24px 20px;
+        transition: border-color 0.2s, transform 0.2s; height: 100%;
+    }
+    .np-feature:hover { border-color: rgba(56,189,248,0.2); transform: translateY(-2px); }
+    .np-feature-icon { font-size: 1.8rem; margin-bottom: 12px; }
+    .np-feature-title {
+        font-family: 'Syne', sans-serif;
+        font-size: 0.95rem; font-weight: 700;
+        color: #e2e8f0; margin-bottom: 6px;
+    }
+    .np-feature-desc { font-size: 0.83rem; color: #475569; line-height: 1.55; }
+
+    /* footer */
+    .np-footer {
+        text-align: center; padding: 32px;
+        border-top: 1px solid rgba(255,255,255,0.05);
+        color: #334155; font-size: 0.82rem;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-# -------------------------------
-# Main Application Logic
-# -------------------------------
-def main():
-    load_css()
-    
-    if not st.session_state.authenticated:
-        show_login_form()
-    else:
-        # Display the main app content for authenticated users
-        show_main_app()
-
-def show_main_app():
-    # Sidebar
-    show_sidebar()
-    
-    # Main content
-    show_main_content()
-
-def show_sidebar():
-    """Enhanced sidebar with better organization"""
-    with st.sidebar:
-        # User info section
-        st.markdown(f"""
-        <div class="glass-card" style="text-align: center;">
-            <div style="font-size: 3em; margin-bottom: 10px;">👤</div>
-            <h3 style="color: #667eea; margin-bottom: 5px;">Welcome</h3>
-            <p style="color: rgba(255,255,255,0.8); margin-bottom: 15px;">{st.session_state.username}</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Quick stats (user-specific)
-        saved_count = get_saved_articles_count(st.session_state.username)
-        st.markdown(f"""
-        <div class="stats-card">
-            <div class="stats-number">{saved_count}</div>
-            <div class="stats-label">Saved Articles</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Navigation buttons
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🏠 Home", key="home_button", use_container_width=True):
-                st.session_state["show_saved"] = False
-                st.session_state["articles"] = []
-                st.rerun()
-        
-        with col2:
-            if st.button("💾 Saved", key="saved_button", use_container_width=True):
-                st.session_state["show_saved"] = True
-                st.session_state["articles"] = []
-                st.rerun()
-        
-        if st.button("🚪 Logout", key="logout_button", use_container_width=True):
-            st.session_state.authenticated = False
-            st.session_state.username = None
-            st.rerun()
-        
-        st.markdown("---")
-        
-        # Search section
-        st.markdown("""
-        <div class="glass-card">
-            <h3 style='text-align:center; color:#667eea; font-size: 1.5em; margin-bottom: 20px;'>
-                🔍 Search News
-            </h3>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        query = st.text_input("Enter keyword:", value="technology", key="search_query")
-        
-        time_filter = st.radio(
-            "Time Filter:",
-            ["Anytime", "Past 24h", "Past week"],
-            index=0,
-            key="time_filter"
-        )
-        
-        max_articles = st.slider(
-            "Number of articles:",
-            min_value=5,
-            max_value=20,
-            value=10,
-            key="max_articles"
-        )
-        
-        if st.button("🚀 Search News", key="search_button", use_container_width=True):
-            with st.spinner("🔄 Fetching latest news... (cached up to 5 mins)"):
-                articles = fetch_news(query, time_filter, max_articles)
-                st.session_state["articles"] = articles if articles else []
-                st.session_state["show_saved"] = False
-                st.session_state["current_query"] = query
-                if articles:
-                    st.success(f"Found {len(articles)} articles!")
-                else:
-                    st.warning("No articles found. Try different keywords.")
-        
-        st.markdown("---")
-        
-        # Trending topics
-        st.markdown("""
-        <div class="glass-card">
-            <h3 style='color: #667eea; text-align: center; margin-bottom: 15px;'>
-                🔥 Trending Topics
-            </h3>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        trending_topics = [
-            {"name": "AI", "icon": "🤖"},
-            {"name": "Tesla", "icon": "🚗"},
-            {"name": "iPhone", "icon": "📱"},
-            {"name": "Cricket", "icon": "🏏"},
-            {"name": "Startups", "icon": "🚀"},
-            {"name": "SpaceX", "icon": "🛸"},
-            {"name": "Bitcoin", "icon": "₿"},
-            {"name": "Climate", "icon": "🌍"}
-        ]
-        
-        cols = st.columns(2)
-        for i, topic in enumerate(trending_topics):
-            col = cols[i % 2]
-            if col.button(f"{topic['icon']} {topic['name']}", key=f"trend_{i}", use_container_width=True):
-                with st.spinner(f"Loading {topic['name']} news... (cached up to 5 mins)"):
-                    articles = fetch_news(topic['name'], time_filter, max_articles)
-                    st.session_state["articles"] = articles
-                    st.session_state["show_saved"] = False
-                    st.session_state["current_query"] = topic['name']
-                    if articles:
-                        st.success(f"Found {len(articles)} articles about {topic['name']}!")
-                    else:
-                        st.warning(f"No articles found for {topic['name']}.")
-
-def show_main_content():
-    """Main content area with improved layouts"""
-    
-    # Header
-    st.markdown('<h1 class="main-header">📰 News Pulse</h1>', unsafe_allow_html=True)
-    
-    # Initialize session state
-    if "articles" not in st.session_state:
-        st.session_state["articles"] = []
-    if "show_saved" not in st.session_state:
-        st.session_state["show_saved"] = False
-    
-    # Show saved articles
-    if st.session_state.get("show_saved", False):
-        show_saved_articles()
-    # Show search results
-    elif st.session_state.get("articles"):
-        show_search_results()
-    # Show welcome screen
-    else:
-        show_welcome_screen()
-
-def show_saved_articles():
-    """Display saved articles with enhanced UI (user-specific)"""
-    st.markdown('<h2 class="news-header">💾 Your Saved Articles</h2>', unsafe_allow_html=True)
-    
-    saved_articles = fetch_articles_from_db(st.session_state.username)
-    
-    if saved_articles:
-        # Stats section
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown(f"""
-            <div class="stats-card">
-                <div class="stats-number">{len(saved_articles)}</div>
-                <div class="stats-label">Total Saved</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            # Get latest article save date
-            latest_date = "N/A"
-            if saved_articles:
-                try:
-                    latest_date = datetime.strptime(saved_articles[0][6], "%Y-%m-%d %H:%M:%S").strftime("%b %d")
-                except:
-                    latest_date = "Today"
-            
-            st.markdown(f"""
-            <div class="stats-card">
-                <div class="stats-number" style="font-size: 1.8em;">{latest_date}</div>
-                <div class="stats-label">Latest Save</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col3:
-            # Count unique sources
-            sources = set()
-            for article in saved_articles:
-                if article[4]:  # source column
-                    sources.add(article[4])
-            
-            st.markdown(f"""
-            <div class="stats-card">
-                <div class="stats-number">{len(sources)}</div>
-                <div class="stats-label">Sources</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        # Articles grid
-        sentiment_counts_saved = {}
-        for i, (title, link, published_at, image_url, source, category, saved_at) in enumerate(saved_articles):
-            with st.container():
-                st.markdown('<div class="article-card">', unsafe_allow_html=True)
-                
-                col1, col2 = st.columns([1, 2])
-                
-                with col1:
-                    if image_url and image_url.strip():
-                        try:
-                            st.image(image_url, use_column_width=True, caption="")
-                        except:
-                            st.markdown("""
-                            <div style="height:200px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                            border-radius:12px; display:flex; align-items:center; justify-content:center; 
-                            color:white; font-size: 4em;">📰</div>
-                            """, unsafe_allow_html=True)
-                    else:
-                        st.markdown("""
-                        <div style="height:200px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                        border-radius:12px; display:flex; align-items:center; justify-content:center; 
-                        color:white; font-size: 4em;">📰</div>
-                        """, unsafe_allow_html=True)
-                
-                with col2:
-                    st.markdown(f'<div class="article-source">📡 {source or "Unknown Source"}</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="article-title">{title}</div>', unsafe_allow_html=True)
-                    
-                    # Date and category info
-                    col2a, col2b = st.columns(2)
-                    with col2a:
-                        st.markdown(f'<div class="article-date">📅 {published_at}</div>', unsafe_allow_html=True)
-                    with col2b:
-                        st.markdown(f'<div class="article-date">💾 Saved: {saved_at[:10] if saved_at else "Unknown"}</div>', unsafe_allow_html=True)
-                    
-                    # Action buttons
-                    btn_col1, btn_col2 = st.columns([1, 1])
-                    with btn_col1:
-                        st.markdown(f"[🔗 Read Article]({link})", unsafe_allow_html=True)
-                    with btn_col2:
-                        st.markdown(f'<span style="color: #f093fb; font-size: 0.9em;">🏷️ {category or "General"}</span>', unsafe_allow_html=True)
-                    
-                    # Delete button
-                    if st.button("🗑️ Delete", key=f"delete_{i}", use_container_width=True):
-                        if delete_saved_article(link, st.session_state.username):
-                            st.success("✅ Article deleted successfully!")
-                            st.rerun() # Rerun to refresh the list
-                        else:
-                            st.error("❌ Failed to delete article.")
-                
-                st.markdown('</div><br>', unsafe_allow_html=True)
-        
-        # Analyze and draw sentiment chart for saved articles
-        saved_articles_titles = [article[0] for article in saved_articles]
-        sentiment_counts_saved = {}
-        for title in saved_articles_titles:
-            _label, _score = analyze_sentiment(title)
-            sentiment_counts_saved[_label] = sentiment_counts_saved.get(_label, 0) + 1
-            
-        draw_sentiment_chart(sentiment_counts_saved, title='Saved Articles Sentiment')
-
-    else:
-        # Empty state for saved articles
-        st.markdown("""
-        <div class="empty-state">
-            <div class="empty-state-icon">📚</div>
-            <div class="empty-state-title">No Saved Articles Yet</div>
-            <div class="empty-state-subtitle">Start exploring news and save articles that interest you!</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Quick action buttons
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("🔍 Search Tech News", use_container_width=True):
-                articles = fetch_news("technology", "Anytime", 10)
-                st.session_state["articles"] = articles
-                st.session_state["show_saved"] = False
-                st.session_state["current_query"] = "technology"
-                st.rerun()
-        
-        with col2:
-            if st.button("📱 Search AI News", use_container_width=True):
-                articles = fetch_news("artificial intelligence", "Anytime", 10)
-                st.session_state["articles"] = articles
-                st.session_state["show_saved"] = False
-                st.session_state["current_query"] = "artificial intelligence"
-                st.rerun()
-        
-        with col3:
-            if st.button("🌍 World News", use_container_width=True):
-                articles = fetch_news("world news", "Anytime", 10)
-                st.session_state["articles"] = articles
-                st.session_state["show_saved"] = False
-                st.session_state["current_query"] = "world news"
-                st.rerun()
-
-def show_search_results():
-    """Display search results with enhanced UI"""
-    current_query = st.session_state.get("current_query", "news")
-    articles = st.session_state["articles"]
-    
-    st.markdown(f'<h2 class="news-header">🌟 Latest Results for "{current_query}" ({len(articles)} articles)</h2>', unsafe_allow_html=True)
-    
-    if articles:
-        sentiment_counts = {}
-        # Quick stats
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown(f"""
-            <div class="stats-card">
-                <div class="stats-number">{len(articles)}</div>
-                <div class="stats-label">Articles Found</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            # Count unique sources
-            sources = set()
-            for article in articles:
-                if article.get("source", {}).get("name"):
-                    sources.add(article["source"]["name"])
-            
-            st.markdown(f"""
-            <div class="stats-card">
-                <div class="stats-number">{len(sources)}</div>
-                <div class="stats-label">News Sources</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col3:
-            # Show time filter applied
-            time_filter = st.session_state.get("time_filter", "Anytime")
-            st.markdown(f"""
-            <div class="stats-card">
-                <div class="stats-number" style="font-size: 1.5em;">⏰</div>
-                <div class="stats-label">{time_filter}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        # Articles display
-        for i, article in enumerate(articles):
-            with st.container():
-                st.markdown('<div class="article-card">', unsafe_allow_html=True)
-                
-                col1, col2 = st.columns([1, 2])
-                
-                with col1:
-                    if article.get("image"):
-                        try:
-                            st.image(article.get("image"), use_column_width=True, caption="")
-                        except:
-                            st.markdown("""
-                            <div style="height:200px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                            border-radius:12px; display:flex; align-items:center; justify-content:center; 
-                            color:white; font-size: 4em;">📰</div>
-                            """, unsafe_allow_html=True)
-                    else:
-                        st.markdown("""
-                        <div style="height:200px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                        border-radius:12px; display:flex; align-items:center; justify-content:center; 
-                        color:white; font-size: 4em;">📰</div>
-                        """, unsafe_allow_html=True)
-                
-                with col2:
-                    # Source name
-                    source_name = article.get("source", {}).get("name", "Unknown Source")
-                    st.markdown(f'<div class="article-source">📡 {source_name}</div>', unsafe_allow_html=True)
-                    
-                    # Title
-                    st.markdown(f'<div class="article-title">{article["title"]}</div>', unsafe_allow_html=True)
-                    
-                    # Description (if available)
-                    if article.get("description"):
-                        description = article["description"][:150] + "..." if len(article["description"]) > 150 else article["description"]
-                        st.markdown(f'<div style="color: rgba(255,255,255,0.7); margin-bottom: 15px; line-height: 1.5;">{description}</div>', unsafe_allow_html=True)
-                    
-                    # Sentiment badge
-                    _text_for_sent = article.get('description') or article.get('title','')
-                    _label, _score = analyze_sentiment(_text_for_sent)
-                    st.markdown(sentiment_badge(_label), unsafe_allow_html=True)
-                    sentiment_counts[_label] = sentiment_counts.get(_label,0)+1
-
-                    # Date
-                    published_date = article.get("publishedAt", "Unknown")
-                    if published_date != "Unknown":
-                        try:
-                            # Format the date nicely
-                            date_obj = datetime.fromisoformat(published_date.replace('Z', '+00:00'))
-                            formatted_date = date_obj.strftime("%B %d, %Y at %I:%M %p")
-                        except:
-                            formatted_date = published_date
-                    else:
-                        formatted_date = "Unknown"
-                    
-                    st.markdown(f'<div class="article-date">📅 {formatted_date}</div>', unsafe_allow_html=True)
-                    
-                    # Action buttons
-                    btn_col1, btn_col2 = st.columns([1, 1])
-                    with btn_col1:
-                        st.markdown(f"[🔗 Read Full Article]({article['url']})", unsafe_allow_html=True)
-                    with btn_col2:
-                        if st.button(f"💾 Save Article", key=f"save_{i}", use_container_width=True):
-                            success, message = save_article(
-                                article["title"],
-                                article["url"],
-                                article.get("publishedAt", "Unknown"),
-                                article.get("image", ""),
-                                source_name,
-                                current_query,  # Use search query as category
-                                username=st.session_state.username
-                            )
-                            if success:
-                                st.success(f"✅ {message}")
-                                st.balloons()
-                            else:
-                                st.warning(f"⚠️ {message}")
-                
-                st.markdown('</div><br>', unsafe_allow_html=True)
-            # Draw sentiment chart for the current results
-        draw_sentiment_chart(sentiment_counts, title='Results Sentiment')
-    else:
-        # No results found
-        st.markdown(f"""
-        <div class="empty-state">
-            <div class="empty-state-icon">🔍</div>
-            <div class="empty-state-title">No Results Found</div>
-            <div class="empty-state-subtitle">Try searching with different keywords or adjust your time filter</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Suggested searches
-        st.markdown("### 💡 Try These Popular Topics:")
-        suggestion_cols = st.columns(4)
-        suggestions = [
-            {"name": "Technology", "icon": "💻"},
-            {"name": "Sports", "icon": "⚽"},
-            {"name": "Business", "icon": "💼"},
-            {"name": "Science", "icon": "🔬"}
-        ]
-        
-        for i, suggestion in enumerate(suggestions):
-            with suggestion_cols[i]:
-                if st.button(f"{suggestion['icon']} {suggestion['name']}", use_container_width=True):
-                    articles = fetch_news(suggestion['name'].lower(), "Anytime", 10)
-                    st.session_state["articles"] = articles
-                    st.session_state["current_query"] = suggestion['name']
-                    st.rerun()
-
-def show_welcome_screen():
-    """Enhanced welcome screen with interactive elements"""
-    st.markdown("""
-    <div class="welcome-section">
-        <div class="welcome-content">
-            <h2 style='color: white; margin-bottom: 20px; font-size: 3em; font-weight: 700;'>
-                🚀 Welcome to News Pulse!
-            </h2>
-            <p style='color: rgba(255,255,255,0.9); font-size: 1.4em; margin-bottom: 30px; line-height: 1.6;'>
-                Stay informed with the latest news from around the globe. Search, discover, and save articles that matter to you.
-            </p>
-        </div>
+# ─────────────────────────────────────────────────────────────
+# NAVBAR
+# ─────────────────────────────────────────────────────────────
+def render_navbar():
+    email   = st.session_state.email or ""
+    initial = email[0].upper() if email else "U"
+    st.markdown(f"""
+    <div class="np-nav">
+      <div class="np-nav-logo">⚡ NewsPulse</div>
+      <div class="np-nav-user">
+        <div class="np-nav-avatar">{initial}</div>
+        <span style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{email}</span>
+      </div>
     </div>
     """, unsafe_allow_html=True)
-    
-    # Feature highlights
-    st.markdown("### ✨ What You Can Do")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.markdown("""
-        <div class="stats-card" style="height: 220px;">
-            <div style='font-size: 3.5em; margin-bottom: 15px;'>🔍</div>
-            <h3 style='color: #667eea; margin-bottom: 10px;'>Search News</h3>
-            <p style='color: rgba(255,255,255,0.8); line-height: 1.4;'>
-                Find articles on any topic with our powerful search engine. Filter by time and get the most relevant results.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown("""
-        <div class="stats-card" style="height: 220px;">
-            <div style='font-size: 3.5em; margin-bottom: 15px;'>💾</div>
-            <h3 style='color: #764ba2; margin-bottom: 10px;'>Save Articles</h3>
-            <p style='color: rgba(255,255,255,0.8); line-height: 1.4;'>
-                Bookmark interesting articles for later reading. Build your personal news library and never lose track of important stories.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown("""
-        <div class="stats-card" style="height: 220px;">
-            <div style='font-size: 3.5em; margin-bottom: 15px;'>🔥</div>
-            <h3 style='color: #f093fb; margin-bottom: 10px;'>Trending Topics</h3>
-            <p style='color: rgba(255,255,255,0.8); line-height: 1.4;'>
-                Explore trending topics and stay updated with the latest happenings in technology, sports, business, and more.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("<br>", unsafe_allow_html=True)
-    
-    # Quick start section
-    st.markdown("### 🚀 Quick Start")
-    
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.markdown("**🌟 Popular Categories**")
-        categories = [
-            {"name": "Technology", "icon": "💻", "desc": "Latest tech news and innovations"},
-            {"name": "Business", "icon": "💼", "desc": "Market updates and business trends"},
-            {"name": "Sports", "icon": "⚽", "desc": "Sports news and match updates"},
-            {"name": "Health", "icon": "🏥", "desc": "Health and medical breakthroughs"}
-        ]
-        
-        for cat in categories:
-            with st.container():
-                if st.button(f"{cat['icon']} {cat['name']}", key=f"cat_{cat['name']}", use_container_width=True):
-                    with st.spinner(f"Loading {cat['name']} news... (cached up to 5 mins)"):
-                        articles = fetch_news(cat['name'].lower(), "Anytime", 10)
-                        st.session_state["articles"] = articles
-                        st.session_state["show_saved"] = False
-                        st.session_state["current_query"] = cat['name']
+
+    nc1, nc2, nc3, nc4, _ = st.columns([1, 1, 1, 1, 6])
+    with nc1:
+        if st.button("🏠 Home", key="nav_home"):
+            st.session_state.page = "home"
+            st.rerun()
+    with nc2:
+        if st.button("🔥 Trending", key="nav_trending"):
+            st.session_state.page = "home"
+            with st.spinner("Loading trending…"):
+                st.session_state.articles      = fetch_news("trending", st.session_state.time_filter, 10)
+                st.session_state.current_query = "Trending"
+            st.rerun()
+    with nc3:
+        if st.button("💾 Saved", key="nav_saved"):
+            st.session_state.page = "saved"
+            st.rerun()
+    with nc4:
+        if st.button("🚪 Logout", key="nav_logout"):
+            for k in ("authenticated","uid","id_token","email","display_name","current_query"):
+                st.session_state[k] = False if k == "authenticated" else None
+            st.session_state.articles    = []
+            st.session_state.auth_view   = "login"
+            st.rerun()
+
+# ─────────────────────────────────────────────────────────────
+# AUTH PAGE
+# ─────────────────────────────────────────────────────────────
+def auth_page():
+    view = st.session_state.auth_view
+    col  = st.columns([1, 1.2, 1])[1]
+
+    with col:
+         
+        st.markdown('<div class="np-auth-logo">⚡ NewsPulse</div>', unsafe_allow_html=True)
+        st.markdown('<div class="np-auth-tagline">The pulse of the world, in real time.</div>', unsafe_allow_html=True)
+
+        # Show Google error if any
+        if st.session_state.google_error:
+            st.error(f"Google Sign-In failed: {st.session_state.google_error}")
+            st.session_state.google_error = None
+
+        # ── LOGIN ─────────────────────────────────────────────
+        if view == "login":
+            st.markdown('<div class="np-auth-title">Welcome back</div>', unsafe_allow_html=True)
+
+            email_in    = st.text_input("Email address", placeholder="you@example.com", key="li_email")
+            password_in = st.text_input("Password", placeholder="••••••••", type="password", key="li_pass")
+
+            
+
+            if st.button("Sign In →", key="do_login", use_container_width=True):
+                if not email_in.strip():
+                    st.error("Please enter your email address.")
+                elif not is_valid_email(email_in):
+                    st.error("Please enter a valid email address (e.g. name@example.com).")
+                elif not password_in:
+                    st.error("Please enter your password.")
+                else:
+                    with st.spinner("Signing in…"):
+                        ok, data = sign_in_email(email_in.strip(), password_in)
+                    if ok:
+                        st.session_state.authenticated = True
+                        st.session_state.uid           = data["localId"]
+                        st.session_state.id_token      = data["idToken"]
+                        st.session_state.email         = data["email"]
+                        st.session_state.display_name  = data.get("displayName", data["email"].split("@")[0])
                         st.rerun()
-                st.caption(cat['desc'])
-    
-    with col2:
-        st.markdown("**📊 Your Stats**")
-        saved_count = get_saved_articles_count(st.session_state.username)
-        
-        # User statistics
-        st.markdown(f"""
-        <div class="glass-card">
-            <div style="text-align: center;">
-                <div style="font-size: 2.5em; color: #667eea; margin-bottom: 10px;">{saved_count}</div>
-                <h4 style="color: white; margin-bottom: 15px;">Articles Saved</h4>
-                <p style="color: rgba(255,255,255,0.7); margin-bottom: 20px;">
-                    {"Great start! Keep exploring and saving interesting articles." if saved_count > 0 else "Start saving articles to build your personal news collection."}
-                </p>
-            </div>
+                    else:
+                        st.error(data)
+                    
+            fc1, fc2, fc3 = st.columns([1, 1, 1])
+            with fc2:
+                if st.button("Forgot password?", key="goto_forgot"):
+                    st.session_state.auth_view = "forgot"
+                    st.rerun()
+            with fc3:
+                if st.button("Create Account", key="goto_signup"):
+                    st.session_state.auth_view = "signup"
+                    st.rerun()
+
+        # ── SIGN UP ────────────────────────────────────────────
+        elif view == "signup":
+            st.markdown('<div class="np-auth-title">Create account</div>', unsafe_allow_html=True)
+
+            email_in = st.text_input("Email address", placeholder="you@example.com", key="su_email")
+            pass1    = st.text_input("Password", placeholder="Min. 6 characters", type="password", key="su_pass1")
+            pass2    = st.text_input("Confirm password", placeholder="Repeat password", type="password", key="su_pass2")
+
+            if st.button("Create Account →", key="do_signup", use_container_width=True):
+                if not email_in.strip():
+                    st.error("Please enter your email address.")
+                elif not is_valid_email(email_in):
+                    st.error("Please enter a valid email address (e.g. name@example.com).")
+                elif len(pass1) < 6:
+                    st.error("Password must be at least 6 characters.")
+                elif pass1 != pass2:
+                    st.error("Passwords do not match.")
+                else:
+                    with st.spinner("Creating account…"):
+                        ok, data = sign_up_email(email_in.strip(), pass1)
+                    if ok:
+                        st.session_state.authenticated = True
+                        st.session_state.uid           = data["localId"]
+                        st.session_state.id_token      = data["idToken"]
+                        st.session_state.email         = data["email"]
+                        st.session_state.display_name  = data["email"].split("@")[0]
+                        st.rerun()
+                    else:
+                        st.error(data)
+
+            st.markdown('<div class="np-auth-footer">', unsafe_allow_html=True)
+            if st.button("← Already have an account? Sign in", key="goto_login_s", use_container_width=True):
+                st.session_state.auth_view = "login"
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── FORGOT PASSWORD ────────────────────────────────────
+        elif view == "forgot":
+            st.markdown('<div class="np-auth-title">Reset password</div>', unsafe_allow_html=True)
+            st.markdown('<p style="color:#475569;font-size:0.88rem;margin-bottom:20px;text-align:center;">Enter your email and we\'ll send a reset link.</p>', unsafe_allow_html=True)
+
+            email_in = st.text_input("Email address", placeholder="you@example.com", key="fp_email")
+
+            if st.button("Send Reset Email →", key="do_reset", use_container_width=True):
+                if not email_in.strip():
+                    st.error("Please enter your email address.")
+                elif not is_valid_email(email_in):
+                    st.error("Please enter a valid email address.")
+                else:
+                    with st.spinner("Sending…"):
+                        ok, msg = send_password_reset(email_in.strip())
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+
+            fc1, fc2 = st.columns([3, 1])
+            with fc1:
+                if st.button("← Back to Sign In", key="goto_login_f"):
+                    st.session_state.auth_view = "login"
+                    st.rerun()
+            with fc2:
+                if st.button("Create Account", key="goto_signup_f"):
+                    st.session_state.auth_view = "signup"
+                    st.rerun()
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────
+# ARTICLE CARD
+# ─────────────────────────────────────────────────────────────
+def render_article_card(article: dict, idx: int, is_saved: bool = False):
+    title    = article.get("title", "Untitled")
+    url      = article.get("url", article.get("link", "#"))
+    desc     = article.get("description", article.get("desc", ""))
+    image    = article.get("image", article.get("image_url", ""))
+    source   = article.get("source", {})
+    src_name = source.get("name", article.get("source","Unknown")) if isinstance(source, dict) else str(source)
+    pub_date = format_date(article.get("publishedAt", article.get("published_at", "")))
+    category = article.get("category", st.session_state.current_query or "General")
+
+    sent_label, _ = analyze_sentiment(desc or title)
+    desc_short     = (desc[:110] + "…") if desc and len(desc) > 110 else (desc or "")
+
+    img_html = (
+        f'<img class="np-card-img" src="{image}" alt="" '
+        f'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">'
+        f'<div class="np-card-img-placeholder" style="display:none">📰</div>'
+        if image else
+        '<div class="np-card-img-placeholder">📰</div>'
+    )
+
+    st.markdown(f"""
+    <div class="np-card">
+      {img_html}
+      <div class="np-card-body">
+        <div class="np-card-source">📡 {src_name}</div>
+        <div class="np-card-title">{title}</div>
+        {"" if not desc_short else f'<div class="np-card-desc">{desc_short}</div>'}
+        <div class="np-card-meta">
+          <span>📅 {pub_date}</span>
+          {sentiment_badge(sent_label)}
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    bc1, bc2, bc3 = st.columns(3)
+    with bc1:
+        st.markdown(
+            f'<a class="np-btn np-btn-primary" href="{url}" target="_blank">🔗 Read</a>',
+            unsafe_allow_html=True
+        )
+    with bc2:
+        if is_saved:
+            if st.button("🗑️ Delete", key=f"del_{idx}", use_container_width=True):
+                if delete_article(st.session_state.uid, st.session_state.id_token, url):
+                    st.success("Removed!")
+                    st.rerun()
+        else:
+            if st.button("💾 Save", key=f"save_{idx}", use_container_width=True):
+                ok, msg = save_article(
+                    st.session_state.uid, st.session_state.id_token,
+                    title, url, pub_date, image, src_name, category
+                )
+                st.success(f"✅ {msg}") if ok else st.warning(f"⚠️ {msg}")
+    with bc3:
+        if st.button("✨ Summarize", key=f"sum_{idx}", use_container_width=True):
+            full_text = f"{title}. {desc or ''} {article.get('content','')}"
+            with st.spinner("Summarizing…"):
+                result = summarize_text(full_text.strip())
+            st.markdown(
+                f'<div class="np-summary"><strong>🤖 AI Summary</strong><br>{result}</div>',
+                unsafe_allow_html=True
+            )
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────
+# HOME PAGE
+# ─────────────────────────────────────────────────────────────
+def home_page():
+    st.markdown("""
+    <div class="np-hero">
+      <div class="np-hero-tag">🌐 Live News Feed</div>
+      <div class="np-hero-title">Stay ahead of <span>every story</span></div>
+      <div class="np-hero-sub">Real-time news · AI summaries · Sentiment analysis</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    sc1, sc2, sc3 = st.columns([1, 2, 1])
+    with sc2:
+        query = st.text_input("", placeholder="🔍  Search any topic…",
+                              key="search_input", label_visibility="collapsed")
+        tf_options = ["Anytime", "Past 24h", "Past week"]
+        tf = st.radio("", tf_options,
+                      index=tf_options.index(st.session_state.time_filter),
+                      horizontal=True, key="time_radio", label_visibility="collapsed")
+        st.session_state.time_filter = tf
+
+        sa, sb = st.columns([3, 1])
+        with sa:
+            max_art = st.slider("Articles", 5, 20, 10, key="max_art_slider", label_visibility="collapsed")
+        with sb:
+            if st.button("Search →", key="do_search", use_container_width=True):
+                if not query.strip():
+                    st.warning("Please enter a search term.")
+                else:
+                    with st.spinner(f"Fetching '{query}'…"):
+                        st.session_state.articles      = fetch_news(query.strip(), tf, max_art)
+                        st.session_state.current_query = query.strip()
+                    st.rerun()
+
+    st.markdown('<div class="np-trending"><span class="np-trending-label">🔥 Trending</span>', unsafe_allow_html=True)
+    topics = [("🤖","AI"),("₿","Bitcoin"),("🚗","Tesla"),("🏏","Cricket"),
+              ("🛸","SpaceX"),("💊","Health"),("🌍","Climate"),("🚀","Startups")]
+    tcols = st.columns(len(topics))
+    for i, (icon, name) in enumerate(topics):
+        with tcols[i]:
+            if st.button(f"{icon} {name}", key=f"tr_{i}", use_container_width=True):
+                with st.spinner(f"Loading {name}…"):
+                    st.session_state.articles      = fetch_news(name, st.session_state.time_filter, 10)
+                    st.session_state.current_query = name
+                st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    articles = st.session_state.articles
+    if articles:
+        q = st.session_state.current_query
+        st.markdown(f'<div class="np-section-head">Results for <span>"{q}"</span> — {len(articles)} articles</div>', unsafe_allow_html=True)
+
+        sources_set = set()
+        sent_counts = {}
+        for a in articles:
+            s = a.get("source", {})
+            n = s.get("name","?") if isinstance(s, dict) else str(s)
+            sources_set.add(n)
+            lb, _ = analyze_sentiment(a.get("description","") or a.get("title",""))
+            sent_counts[lb] = sent_counts.get(lb, 0) + 1
+
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            st.markdown(f'<div class="np-stat"><div class="np-stat-val">{len(articles)}</div><div class="np-stat-lbl">Articles</div></div>', unsafe_allow_html=True)
+        with s2:
+            st.markdown(f'<div class="np-stat"><div class="np-stat-val">{len(sources_set)}</div><div class="np-stat-lbl">Sources</div></div>', unsafe_allow_html=True)
+        with s3:
+            top_sent = max(sent_counts, key=sent_counts.get) if sent_counts else "neutral"
+            st.markdown(f'<div class="np-stat"><div class="np-stat-val" style="font-size:1.2rem">{top_sent.title()}</div><div class="np-stat-lbl">Dominant Tone</div></div>', unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        col_l, col_r = st.columns(2)
+        for i, art in enumerate(articles):
+            with col_l if i % 2 == 0 else col_r:
+                render_article_card(art, i)
+
+        draw_sentiment_chart(sent_counts, "Sentiment Analysis")
+
+    else:
+        hour  = datetime.now().hour
+        greet = "Good morning" if hour < 12 else "Good afternoon" if hour < 17 else "Good evening"
+        name  = st.session_state.display_name or (st.session_state.email or "there").split("@")[0]
+        st.markdown(f'<div style="padding:0 40px 12px;color:#475569;font-size:1rem;">{greet}, <strong style="color:#94a3b8">{name}</strong> 👋</div>', unsafe_allow_html=True)
+        st.markdown('<div class="np-section-head"><span>What you can do</span></div>', unsafe_allow_html=True)
+
+        features = [
+            ("🔍","Search News","Find articles on any topic instantly."),
+            ("🤖","AI Summaries","Click ✨ Summarize for instant NLP summaries."),
+            ("📊","Sentiment Meter","Every article is analysed for emotional tone."),
+            ("💾","Save Articles","Bookmark to Firestore — accessible anywhere."),
+            ("🔥","Trending","One click to load what the world is reading."),
+        ]
+        fcols = st.columns(len(features))
+        for i, (icon, t, d) in enumerate(features):
+            with fcols[i]:
+                st.markdown(f"""
+                <div class="np-feature">
+                  <div class="np-feature-icon">{icon}</div>
+                  <div class="np-feature-title">{t}</div>
+                  <div class="np-feature-desc">{d}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown('<div class="np-section-head" style="padding-top:24px"><span>Quick Start</span></div>', unsafe_allow_html=True)
+        cats  = [("💻","Technology"),("💼","Business"),("⚽","Sports"),("🔬","Science"),("🎬","Entertainment")]
+        ccols = st.columns(len(cats))
+        for i, (icon, name_) in enumerate(cats):
+            with ccols[i]:
+                if st.button(f"{icon} {name_}", key=f"qs_{i}", use_container_width=True):
+                    with st.spinner(f"Loading {name_}…"):
+                        st.session_state.articles      = fetch_news(name_, "Anytime", 10)
+                        st.session_state.current_query = name_
+                    st.rerun()
+
+# ─────────────────────────────────────────────────────────────
+# SAVED PAGE
+# ─────────────────────────────────────────────────────────────
+def saved_page():
+    st.markdown('<div class="np-section-head" style="padding-top:32px"><span>Your Saved Articles</span></div>', unsafe_allow_html=True)
+
+    with st.spinner("Loading your saved articles…"):
+        saved = fetch_saved_articles(st.session_state.uid, st.session_state.id_token)
+
+    if not saved:
+        st.markdown("""
+        <div class="np-empty">
+          <div class="np-empty-icon">📚</div>
+          <div class="np-empty-title">Nothing saved yet</div>
+          <div class="np-empty-sub">Search for news and click 💾 Save on any article.</div>
         </div>
         """, unsafe_allow_html=True)
-        
-        # Today's date and greeting
-        today = datetime.now()
-        greeting = "Good morning" if today.hour < 12 else "Good afternoon" if today.hour < 17 else "Good evening"
-        
-        st.markdown(f"""
-        <div class="glass-card" style="text-align: center;">
-            <h4 style="color: #764ba2; margin-bottom: 10px;">{greeting}, {st.session_state.username}!</h4>
-            <p style="color: rgba(255,255,255,0.8);">📅 {today.strftime("%A, %B %d, %Y")}</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Recent news preview
-    st.markdown("---")
-    st.markdown("### 📈 Recent News Headlines")
-    
-    with st.spinner("Fetching latest news for preview..."):
-        try:
-            # Fetch a small number of recent articles on a general topic
-            preview_articles = fetch_news("headlines", time_filter="Past 24h", max_articles=5)
-            if preview_articles:
-                for article in preview_articles:
-                    st.markdown(f"**{article['title']}** \n*{article.get('source', {}).get('name', 'Unknown Source')}*")
-            else:
-                st.info("Couldn't fetch news at this time. Please use the search bar to find articles.")
-        except Exception as e:
-            st.error(f"An error occurred while fetching news preview: {e}")
-    
-# Run the main application
+        return
+
+    sources_set = set(a.get("source","?") for a in saved)
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        st.markdown(f'<div class="np-stat"><div class="np-stat-val">{len(saved)}</div><div class="np-stat-lbl">Saved</div></div>', unsafe_allow_html=True)
+    with s2:
+        st.markdown(f'<div class="np-stat"><div class="np-stat-val">{len(sources_set)}</div><div class="np-stat-lbl">Sources</div></div>', unsafe_allow_html=True)
+    with s3:
+        latest = saved[0].get("saved_at","")[:10] if saved else "—"
+        st.markdown(f'<div class="np-stat"><div class="np-stat-val" style="font-size:1.1rem">{latest}</div><div class="np-stat-lbl">Latest Save</div></div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    sent_counts = {}
+    col_l, col_r = st.columns(2)
+    for i, art in enumerate(saved):
+        mapped = {
+            "title":       art.get("title",""),
+            "url":         art.get("url",""),
+            "link":        art.get("url",""),
+            "description": art.get("desc",""),
+            "image":       art.get("image_url",""),
+            "image_url":   art.get("image_url",""),
+            "source":      art.get("source","Unknown"),
+            "publishedAt": art.get("published_at",""),
+            "category":    art.get("category","General"),
+        }
+        lb, _ = analyze_sentiment(mapped.get("title",""))
+        sent_counts[lb] = sent_counts.get(lb, 0) + 1
+        with col_l if i % 2 == 0 else col_r:
+            render_article_card(mapped, i, is_saved=True)
+
+    draw_sentiment_chart(sent_counts, "Saved Articles Sentiment")
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+def main():
+    inject_css()
+
+    if not st.session_state.authenticated:
+        auth_page()
+        return
+
+    render_navbar()
+
+    if st.session_state.page == "saved":
+        saved_page()
+    else:
+        home_page()
+
+    st.markdown(
+        '<div class="np-footer">⚡ NewsPulse — Powered by GNews &amp; sumy NLP · Built with Streamlit</div>',
+        unsafe_allow_html=True
+    )
+
 if __name__ == "__main__":
     main()
