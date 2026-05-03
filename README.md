@@ -2,6 +2,7 @@
 
 **News Pulse App** is a personalized news platform that provides real-time news articles with sentiment analysis.  
 It integrates user authentication, profile management, and article saving features to deliver a smart, secure, and user-friendly experience.
+
 **CHECK THE APP ONCE: https://newspulse-zped7cqpkqrqgfaj8jc394.streamlit.app/**
 ---
 
